@@ -25,6 +25,26 @@ export type IssueUpdateResponse = Issue & {
   comment?: IssueComment | null;
 };
 
+export interface RunTreeNode {
+  id: string;
+  identifier: string | null;
+  title: string;
+  status: string;
+  priority: string;
+  parentId: string | null;
+  assigneeAgentId: string | null;
+  assigneeAgentName: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  createdAt: string;
+}
+
+export interface RunTreeResponse {
+  rootId: string;
+  focusId: string;
+  nodes: RunTreeNode[];
+}
+
 export const issuesApi = {
   list: (
     companyId: string,
@@ -233,4 +253,5 @@ export const issuesApi = {
   updateWorkProduct: (id: string, data: Record<string, unknown>) =>
     api.patch<IssueWorkProduct>(`/work-products/${id}`, data),
   deleteWorkProduct: (id: string) => api.delete<IssueWorkProduct>(`/work-products/${id}`),
+  runTree: (id: string) => api.get<RunTreeResponse>(`/issues/${id}/run-tree`),
 };

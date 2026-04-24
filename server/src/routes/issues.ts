@@ -3,7 +3,8 @@ import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
 import type { Db } from "@paperclipai/db";
-import { issueExecutionDecisions } from "@paperclipai/db";
+import { agents as agentsTable, issues as issuesTable, issueExecutionDecisions } from "@paperclipai/db";
+import { and, eq, inArray, isNull } from "drizzle-orm";
 import {
   addIssueCommentSchema,
   acceptIssueThreadInteractionSchema,
@@ -3634,6 +3635,128 @@ export function issueRoutes(
     });
 
     res.json({ ok: true });
+  });
+
+  // ---------------------------------------------------------------------------
+  // GET /issues/:id/run-tree — recursive spawn tree (parent → children → …)
+  // ---------------------------------------------------------------------------
+  router.get("/issues/:id/run-tree", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await svc.getById(id);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+
+    // Walk up to the root of the tree if this issue has a parent
+    let rootId = issue.id;
+    let current = issue;
+    const maxDepth = 20; // safety limit
+    let depth = 0;
+    while (current.parentId && depth < maxDepth) {
+      const parent = await svc.getById(current.parentId);
+      if (!parent) break;
+      rootId = parent.id;
+      current = parent;
+      depth++;
+    }
+
+    // Fetch all descendants from the root in a single recursive query
+    interface SpawnTreeNode {
+      id: string;
+      identifier: string | null;
+      title: string;
+      status: string;
+      priority: string;
+      parentId: string | null;
+      assigneeAgentId: string | null;
+      assigneeAgentName: string | null;
+      startedAt: string | null;
+      completedAt: string | null;
+      createdAt: string;
+    }
+
+    // Collect all issues in the tree using breadth-first traversal
+    const nodeMap = new Map<string, SpawnTreeNode>();
+    const rootIssue = rootId === issue.id ? issue : await svc.getById(rootId);
+    if (!rootIssue) {
+      res.json({ root: null, nodes: [] });
+      return;
+    }
+
+    // Collect agent IDs for batch lookup
+    const agentIds = new Set<string>();
+
+    const toNode = (i: {
+      id: string;
+      identifier: string | null;
+      title: string;
+      status: string;
+      priority: string;
+      parentId: string | null;
+      assigneeAgentId: string | null;
+      startedAt: Date | string | null;
+      completedAt: Date | string | null;
+      createdAt: Date | string;
+    }): SpawnTreeNode => {
+      if (i.assigneeAgentId) agentIds.add(i.assigneeAgentId);
+      return {
+        id: i.id,
+        identifier: i.identifier,
+        title: i.title,
+        status: i.status,
+        priority: i.priority,
+        parentId: i.parentId,
+        assigneeAgentId: i.assigneeAgentId,
+        assigneeAgentName: null,
+        startedAt: i.startedAt ? new Date(i.startedAt).toISOString() : null,
+        completedAt: i.completedAt ? new Date(i.completedAt).toISOString() : null,
+        createdAt: new Date(i.createdAt).toISOString(),
+      };
+    };
+
+    nodeMap.set(rootIssue.id, toNode(rootIssue));
+
+    // BFS: fetch children level by level
+    let frontier = [rootIssue.id];
+    let treeDepth = 0;
+    while (frontier.length > 0 && treeDepth < maxDepth) {
+      const children = await db
+        .select()
+        .from(issuesTable)
+        .where(
+          and(
+            eq(issuesTable.companyId, rootIssue.companyId),
+            inArray(issuesTable.parentId, frontier),
+          ),
+        );
+      if (children.length === 0) break;
+      const nextFrontier: string[] = [];
+      for (const child of children) {
+        nodeMap.set(child.id, toNode(child));
+        nextFrontier.push(child.id);
+      }
+      frontier = nextFrontier;
+      treeDepth++;
+    }
+
+    // Batch-fetch agent names
+    if (agentIds.size > 0) {
+      const agentRows = await db
+        .select({ id: agentsTable.id, name: agentsTable.name })
+        .from(agentsTable)
+        .where(inArray(agentsTable.id, [...agentIds]));
+      const agentNameMap = new Map(agentRows.map((a) => [a.id, a.name]));
+      for (const node of nodeMap.values()) {
+        if (node.assigneeAgentId) {
+          node.assigneeAgentName = agentNameMap.get(node.assigneeAgentId) ?? null;
+        }
+      }
+    }
+
+    const nodes = [...nodeMap.values()];
+    res.json({ rootId, focusId: issue.id, nodes });
   });
 
   return router;

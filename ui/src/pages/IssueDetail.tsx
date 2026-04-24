@@ -74,6 +74,7 @@ import { IssueWorkspaceCard } from "../components/IssueWorkspaceCard";
 import type { MentionOption } from "../components/MarkdownEditor";
 import { ImageGalleryModal } from "../components/ImageGalleryModal";
 import { ScrollToBottom } from "../components/ScrollToBottom";
+import { SpawnTree } from "../components/SpawnTree";
 import { StatusIcon } from "../components/StatusIcon";
 import { PriorityIcon } from "../components/PriorityIcon";
 import { Identity } from "../components/Identity";
@@ -108,6 +109,7 @@ import {
   ChevronRight,
   Copy,
   EyeOff,
+  GitBranch,
   Hexagon,
   ListTree,
   MessageSquare,
@@ -3338,6 +3340,10 @@ export function IssueDetail() {
             <ListTree className="h-3.5 w-3.5" />
             Related work
           </TabsTrigger>
+          <TabsTrigger value="spawn-tree" className="gap-1.5">
+            <GitBranch className="h-3.5 w-3.5" />
+            Spawn tree
+          </TabsTrigger>
           {issuePluginTabItems.map((item) => (
             <TabsTrigger key={item.value} value={item.value}>
               {item.label}
@@ -3412,6 +3418,10 @@ export function IssueDetail() {
 
         <TabsContent value="related-work">
           <IssueRelatedWorkPanel relatedWork={issue.relatedWork} />
+        </TabsContent>
+
+        <TabsContent value="spawn-tree">
+          <SpawnTree issueId={issue.id} issueStatus={issue.status} />
         </TabsContent>
 
         {activePluginTab && (
