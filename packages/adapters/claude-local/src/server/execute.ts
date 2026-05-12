@@ -818,6 +818,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             stdout: proc.stdout,
             stderr: proc.stderr,
             errorMessage: fallbackErrorMessage,
+            rateLimitResetAtUnix: parsedStream.rateLimitResetAtUnix,
           })
         : null;
       const errorCode = loginMeta.requiresLogin
@@ -900,6 +901,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           stdout: proc.stdout,
           stderr: proc.stderr,
           errorMessage,
+          rateLimitResetAtUnix: parsedStream.rateLimitResetAtUnix,
         })
       : null;
     const resolvedErrorCode = loginMeta.requiresLogin
