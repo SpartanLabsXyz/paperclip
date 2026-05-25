@@ -738,6 +738,68 @@ describe("agent issue mutation checkout ownership", () => {
     });
   });
 
+  it("rejects agent in_review to done status transitions", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_review" }));
+
+    const res = await request(await createApp(ownerActor())).patch(`/api/issues/${issueId}`).send({ status: "done" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body).toEqual({
+      error: "in_review_to_done_reserved",
+      message: "Transition 'in_review \u2192 done' is reserved for CTO/Adrian after PR merges. Leave the ticket in 'in_review' \u2014 drain-in-review sweep will close it.",
+      hint: "See simmer-labs/skills/paperclip/SKILL.md \u2192 Update Issue (SIM-1907).",
+    });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  }, 10_000);
+
+  it("allows local implicit admin in_review to done status transitions", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_review" }));
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue({ status: "in_review" }),
+      ...patch,
+    }));
+
+    const res = await request(await createApp(boardActor())).patch(`/api/issues/${issueId}`).send({ status: "done" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({ status: "done", actorUserId: "board-user" }),
+    );
+  });
+
+  it("allows agent todo to done status transitions", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo" }));
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue({ status: "todo" }),
+      ...patch,
+    }));
+
+    const res = await request(await createApp(ownerActor())).patch(`/api/issues/${issueId}`).send({ status: "done" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({ status: "done", actorAgentId: ownerAgentId }),
+    );
+  });
+
+  it("allows agent in_review to in_progress status transitions", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_review" }));
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue({ status: "in_review" }),
+      ...patch,
+    }));
+
+    const res = await request(await createApp(ownerActor())).patch(`/api/issues/${issueId}`).send({ status: "in_progress" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({ status: "in_progress", actorAgentId: ownerAgentId }),
+    );
+  });
+
   it("rejects peer-agent status updates that would clear a recovery action they do not own", async () => {
     mockIssueService.getById.mockResolvedValue(
       makeIssue({ status: "blocked", assigneeAgentId: null, assigneeUserId: "board-user" }),

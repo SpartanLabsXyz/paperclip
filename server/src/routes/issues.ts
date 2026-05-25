@@ -1172,6 +1172,24 @@ export function issueRoutes(
     });
   }
 
+  function assertInReviewDoneTransitionAllowed(
+    req: Request,
+    res: Response,
+    input: { existingStatus: string; nextStatus: unknown },
+  ) {
+    if (input.existingStatus !== "in_review" || input.nextStatus !== "done") return true;
+    if (req.actor.type === "board" && (req.actor.source === "local_implicit" || req.actor.isInstanceAdmin)) {
+      return true;
+    }
+
+    res.status(403).json({
+      error: "in_review_to_done_reserved",
+      message: "Transition 'in_review \u2192 done' is reserved for CTO/Adrian after PR merges. Leave the ticket in 'in_review' \u2014 drain-in-review sweep will close it.",
+      hint: "See simmer-labs/skills/paperclip/SKILL.md \u2192 Update Issue (SIM-1907).",
+    });
+    return false;
+  }
+
   async function logExpiredRequestConfirmations(input: {
     issue: { id: string; companyId: string; identifier?: string | null };
     interactions: Array<{ id: string; kind: string; status: string; result?: unknown }>;
@@ -3627,6 +3645,14 @@ export function issueRoutes(
       updateFields,
       actorType: req.actor.type,
     });
+    if (
+      !assertInReviewDoneTransitionAllowed(req, res, {
+        existingStatus: existing.status,
+        nextStatus: updateFields.status,
+      })
+    ) {
+      return;
+    }
 
     const nextAssigneeAgentId =
       updateFields.assigneeAgentId === undefined ? existing.assigneeAgentId : (updateFields.assigneeAgentId as string | null);
