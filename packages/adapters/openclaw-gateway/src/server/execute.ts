@@ -86,7 +86,13 @@ type GatewayClientRequestOptions = {
   expectFinal?: boolean;
 };
 
-const PROTOCOL_VERSION = 3;
+// ===== SIMMER LOCAL PATCH #2 — DO NOT REMOVE WHEN PULLING UPSTREAM =====
+// OpenClaw >= 2026.5.16 raised the gateway WS minimum protocol from 3 to 4
+// (observed: 2026.5.20 rejects v3 handshakes with code 1002 "protocol mismatch").
+// Upstream fix PR #7283 (also #6138/#6188/#6785) — all unmerged as of 2026-06-10.
+// If upstream merges a protocol bump, delete this block and keep their constant.
+const PROTOCOL_VERSION = 4; // upstream value: 3
+// ===== END SIMMER LOCAL PATCH #2 =====
 const DEFAULT_SCOPES = ["operator.admin"];
 const DEFAULT_CLIENT_ID = "gateway-client";
 const DEFAULT_CLIENT_MODE = "backend";
