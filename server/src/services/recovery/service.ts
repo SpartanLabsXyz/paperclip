@@ -74,6 +74,11 @@ import {
   withRecoveryModelProfileHint,
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
+import {
+  buildWakeStormEscalationComment,
+  readWakeStormBreakerConfig,
+  shouldTripWakeStormBreaker,
+} from "./wakeup-storm-breaker.js";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["interrupted", "failed", "cancelled", "timed_out"] as const;
@@ -805,6 +810,26 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return { consecutive, latestFinishedAt };
   }
 
+  // Simmer local patch (SIM-2814): count system-recovery runs for an issue in
+  // a trailing window. Only runs whose context snapshot carries a retryReason
+  // are counted — those are exclusively automation-recovery wakes (stranded
+  // reconciler + transient-failure retry cascade), so genuine agent work and
+  // human-triggered wakes can never trip the breaker.
+  async function countRecentRecoveryRunsForIssue(issueId: string, windowMinutes: number) {
+    const cutoff = new Date(Date.now() - windowMinutes * 60_000);
+    const rows = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          gte(heartbeatRuns.createdAt, cutoff),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          sql`${heartbeatRuns.contextSnapshot} ->> 'retryReason' is not null`,
+        ),
+      );
+    return rows[0]?.count ?? 0;
+  }
+
   async function hasActiveExecutionPath(companyId: string, issueId: string, agentId?: string | null) {
     const [run, deferredWake] = await Promise.all([
       db
@@ -1017,7 +1042,49 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     source: string;
     retryOfRunId?: string | null;
     extraContext?: Record<string, unknown>;
+    // Simmer local patch (SIM-2814): when the caller has the issue row +
+    // latest run in scope, the wake-storm breaker can escalate instead of
+    // silently skipping. Both reconciler call sites pass these.
+    stormBreakerIssue?: typeof issues.$inferSelect;
+    stormBreakerLatestRun?: LatestIssueRun;
   }) {
+    // Simmer local patch (SIM-2814): frequency breaker independent of the
+    // liveness judge's content classification. See wakeup-storm-breaker.ts.
+    const stormConfig = readWakeStormBreakerConfig();
+    const recentRecoveryRunCount = await countRecentRecoveryRunsForIssue(
+      input.issueId,
+      stormConfig.windowMinutes,
+    );
+    if (shouldTripWakeStormBreaker({ recentRecoveryRunCount, config: stormConfig })) {
+      logger.warn(
+        {
+          issueId: input.issueId,
+          agentId: input.agentId,
+          recentRecoveryRunCount,
+          windowMinutes: stormConfig.windowMinutes,
+          maxRecoveryRuns: stormConfig.maxRecoveryRuns,
+          source: input.source,
+        },
+        "wakeup-storm breaker tripped; refusing recovery enqueue (SIM-2814)",
+      );
+      const issue = input.stormBreakerIssue;
+      if (
+        issue &&
+        (issue.status === "todo" || issue.status === "in_progress")
+      ) {
+        await escalateStrandedAssignedIssue({
+          issue,
+          previousStatus: issue.status,
+          latestRun: input.stormBreakerLatestRun ?? null,
+          comment: buildWakeStormEscalationComment({ recentRecoveryRunCount, config: stormConfig }),
+        }).catch((err) => {
+          logger.error({ err, issueId: input.issueId }, "wake-storm escalation failed (SIM-2814)");
+          return null;
+        });
+      }
+      return null;
+    }
+
     const queued = await deps.enqueueWakeup(input.agentId, {
       source: "automation",
       triggerDetail: "system",
@@ -3913,6 +3980,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           retryReason: "assignment_recovery",
           source: "issue.assignment_recovery",
           retryOfRunId: latestRun.id,
+          stormBreakerIssue: issue,
+          stormBreakerLatestRun: latestRun,
         });
         if (queued) {
           result.dispatchRequeued += 1;
@@ -4001,6 +4070,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           retryReason: "issue_continuation_needed",
           source: "issue.productive_terminal_continuation_recovery",
           retryOfRunId: successfulRun.id,
+          stormBreakerIssue: issue,
+          stormBreakerLatestRun: successfulRun,
         });
         if (queued) {
           result.continuationRequeued += 1;
