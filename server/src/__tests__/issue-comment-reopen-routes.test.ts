@@ -311,7 +311,11 @@ describe.sequential("issue comment reopen routes", () => {
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockAccessService.canUser.mockResolvedValue(false);
     mockAccessService.decide.mockImplementation(async (input: { action?: string }) => {
-      const allowed = input.action !== "tasks:manage_active_checkouts";
+      // SIM-3470: these tests use plain non-PM non-assignee actors, which the real
+      // authorization service denies for both checkout-management and backlog (issue:mutate)
+      // overrides. Model that so the guard's 403 path is exercised.
+      const allowed =
+        input.action !== "tasks:manage_active_checkouts" && input.action !== "issue:mutate";
       return {
         allowed,
         action: input.action,

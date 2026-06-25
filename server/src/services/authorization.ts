@@ -755,6 +755,24 @@ export function authorizationService(db: Db) {
           explanation: "Allowed because the issue has no agent assignee.",
         });
       }
+      // SIM-3470: a PM/CEO agent may route a non-active (backlog/todo) issue that
+      // is assigned to another agent. An assignee on a not-yet-checked-out issue is
+      // a routing hint, not an active claim; active (in_progress) checkouts stay
+      // protected by the checkout-ownership path.
+      if (
+        resource &&
+        resource.assigneeAgentId &&
+        resource.assigneeAgentId !== actorAgentId &&
+        resource.status !== "in_progress" &&
+        (actorAgent.role === "pm" || actorAgent.role === "ceo")
+      ) {
+        return allow({
+          action: input.action,
+          reason: "allow_manager_chain",
+          explanation:
+            "Allowed because a PM or CEO agent may manage a non-active (backlog) issue routed to another agent.",
+        });
+      }
     }
     if (
       input.action === "agent_config:update" &&

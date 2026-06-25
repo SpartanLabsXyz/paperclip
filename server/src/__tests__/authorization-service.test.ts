@@ -397,6 +397,63 @@ describeEmbeddedPostgres("authorization service", () => {
     });
   });
 
+  it("lets a PM agent mutate a non-active issue routed to another agent (SIM-3470)", async () => {
+    const company = await createCompany(db, "BacklogPM");
+    const pmAgent = await createAgent(db, company.id, { role: "pm" });
+    const targetAgent = await createAgent(db, company.id, { role: "engineer" });
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: pmAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        assigneeAgentId: targetAgent.id,
+        status: "backlog",
+      },
+    });
+
+    expect(decision).toMatchObject({ allowed: true, reason: "allow_manager_chain" });
+  });
+
+  it("does not let a PM agent mutate an in_progress issue checked out by another agent (SIM-3470)", async () => {
+    const company = await createCompany(db, "BacklogPMActive");
+    const pmAgent = await createAgent(db, company.id, { role: "pm" });
+    const targetAgent = await createAgent(db, company.id, { role: "engineer" });
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: pmAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        assigneeAgentId: targetAgent.id,
+        status: "in_progress",
+      },
+    });
+
+    expect(decision.allowed).toBe(false);
+  });
+
+  it("does not let a non-PM agent mutate a backlog issue routed to another agent (SIM-3470)", async () => {
+    const company = await createCompany(db, "BacklogEng");
+    const actorAgent = await createAgent(db, company.id, { role: "engineer" });
+    const targetAgent = await createAgent(db, company.id, { role: "engineer" });
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        assigneeAgentId: targetAgent.id,
+        status: "backlog",
+      },
+    });
+
+    expect(decision.allowed).toBe(false);
+  });
+
   it("allows scoped assignment inside a granted project and denies other projects", async () => {
     const company = await createCompany(db, "ProjectScope");
     const project = await createProject(db, company.id, "Allowed");
