@@ -3492,6 +3492,23 @@ export function issueRoutes(
     return decision.allowed;
   }
 
+  async function hasBacklogManagementOverride(
+    actorAgentId: string,
+    companyId: string,
+    status: string,
+    assigneeAgentId: string,
+  ) {
+    // Simmer local patch (SIM-3470): delegates to issue:mutate, which allows
+    // PM/CEO agents to manage non-active (backlog/todo) issues routed to
+    // another agent.
+    const decision = await access.decide({
+      actor: { type: "agent", agentId: actorAgentId, companyId },
+      action: "issue:mutate",
+      resource: { type: "issue", companyId, assigneeAgentId, status },
+    });
+    return decision.allowed;
+  }
+
   async function assertAgentIssueMutationAllowed(
     req: Request,
     res: Response,
@@ -3544,6 +3561,17 @@ export function issueRoutes(
     }
     if (issue.assigneeAgentId !== actorAgentId) {
       if (await hasActiveCheckoutManagementOverride(actorAgentId, issue.companyId, issue.assigneeAgentId)) {
+        return true;
+      }
+      if (
+        issue.status !== "in_progress" &&
+        (await hasBacklogManagementOverride(
+          actorAgentId,
+          issue.companyId,
+          issue.status,
+          issue.assigneeAgentId,
+        ))
+      ) {
         return true;
       }
       if (issue.status === "in_progress") {

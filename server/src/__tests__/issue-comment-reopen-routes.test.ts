@@ -333,8 +333,25 @@ describe.sequential("issue comment reopen routes", () => {
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockAccessService.canUser.mockResolvedValue(false);
-    mockAccessService.decide.mockImplementation(async (input: { action?: string }) => {
-      const allowed = input.action !== "tasks:manage_active_checkouts";
+    mockAccessService.decide.mockImplementation(async (input: {
+      action?: string;
+      actor?: { type?: string; agentId?: string | null };
+      resource?: { issueId?: string | null; assigneeAgentId?: string | null };
+    }) => {
+      // SIM-3470: these tests use plain non-PM agent actors, which the real
+      // authorization service denies the backlog-management override for.
+      // The override probe (hasBacklogManagementOverride) is the issue:mutate
+      // call WITHOUT an issueId in the resource; the boundary check
+      // (decideIssueAccess) passes issueId and stays permissive here so the
+      // guard's own ownership 403/409 branches are the ones exercised.
+      const deniesBacklogManagementOverride =
+        input.action === "issue:mutate" &&
+        input.actor?.type === "agent" &&
+        !input.resource?.issueId &&
+        Boolean(input.resource?.assigneeAgentId) &&
+        input.resource?.assigneeAgentId !== input.actor?.agentId;
+      const allowed =
+        input.action !== "tasks:manage_active_checkouts" && !deniesBacklogManagementOverride;
       return {
         allowed,
         action: input.action,
