@@ -1072,7 +1072,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     );
   });
 
-  it("keeps the source issue blocked when source-scoped wakeup is claimed synchronously", async () => {
+  // Simmer local patch (SIM-3773): the daemon no longer re-stamps status/assignee after
+  // enqueueing the recovery wake — a concurrent writer (manual CTO PATCH or a synchronous
+  // wake claim) wins, and the next reconcile sweep re-parks the issue if still stranded.
+  it("parks in place and does not re-stamp a concurrent status change after the recovery wake", async () => {
     const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
     await db.update(agents).set({ status: "paused" }).where(eq(agents.id, managerId));
     const enqueueWakeup = vi.fn(async () => {
@@ -1101,7 +1104,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
 
     const [afterFirst] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
-    expect(afterFirst?.status).toBe("blocked");
+    // The mocked wake claimed the issue back to in_progress after the block update; the
+    // daemon must not re-stamp it, and the assignee is never touched (park-in-place).
+    expect(afterFirst?.status).toBe("in_progress");
     expect(afterFirst?.assigneeAgentId).toBe(coderId);
 
     const secondLatestRun = {
@@ -1130,11 +1135,83 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       attemptCount: 2,
     });
     const [afterSecond] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
-    expect(afterSecond?.status).toBe("blocked");
+    expect(afterSecond?.status).toBe("in_progress");
+    expect(afterSecond?.assigneeAgentId).toBe(coderId);
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, sourceIssue.id));
     expect(comments).toHaveLength(1);
     expect(comments[0]?.body).toContain("Recovery action:");
+  });
+
+  // Simmer local patch (SIM-3773): a stranded escalation read can be stale — if the
+  // issue reached a terminal or manually-moved status in the meantime, escalation
+  // must be a no-op (SIM-3769: recovery fired on a cancelled issue).
+  it("does not escalate over a terminal or manually-moved issue", async () => {
+    const { coderId, sourceIssue } = await seedCompany();
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "adapter failed",
+      errorCode: "adapter_failed",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+    } as const;
+
+    for (const manualStatus of ["cancelled", "done", "in_review"] as const) {
+      await db.update(issues).set({ status: manualStatus }).where(eq(issues.id, sourceIssue.id));
+      const result = await recovery.escalateStrandedAssignedIssue({
+        issue: sourceIssue,
+        previousStatus: "in_progress",
+        latestRun,
+        comment: "Automatic continuation recovery failed.",
+      });
+      expect(result).toBeNull();
+      const [after] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+      expect(after?.status).toBe(manualStatus);
+      expect(after?.assigneeAgentId).toBe(coderId);
+    }
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, sourceIssue.id));
+    expect(comments).toHaveLength(0);
+  });
+
+  // Simmer local patch (SIM-3773): park-in-place — when the recovery owner resolves to
+  // a DIFFERENT agent (org-chart manager), the stranded issue keeps its assignee; the
+  // owner only lands on the recovery action (SIM-3769: the daemon reassigned a Cody
+  // money-path ticket to the org root, whose runtime then executed it).
+  it("parks a stranded issue with its original assignee when the recovery owner is another agent", async () => {
+    const { managerId, coderId, sourceIssue } = await seedCompany();
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "adapter failed",
+      errorCode: "adapter_failed",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+    } as const;
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    const [after] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    expect(after?.status).toBe("blocked");
+    expect(after?.assigneeAgentId).toBe(coderId);
+
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(actionRows).toHaveLength(1);
+    expect(actionRows[0]?.ownerAgentId).toBe(managerId);
+    expect(actionRows[0]?.returnOwnerAgentId).toBe(coderId);
   });
 
   it("does not create nested recovery artifacts when issue-backed fallback work itself fails", async () => {

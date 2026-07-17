@@ -3226,6 +3226,28 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       });
     }
 
+    // Simmer local patch (SIM-3773): park-in-place recovery.
+    // Re-read the issue first: the sweep/heartbeat read can be stale, and a manual
+    // board/CTO PATCH (status reset, review move, cancel) must win over automatic
+    // escalation (SIM-3769: recovery re-stamped a manual todo reset and later fired
+    // on a cancelled issue). Re-sited for the upstream failure-cause router: the
+    // original status allowlist would break execution-review participant recovery,
+    // which legitimately escalates in_review issues — so the guard is now "the
+    // issue must still be where the caller read it, and never terminal".
+    const [freshIssue] = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, input.issue.id))
+      .limit(1);
+    if (
+      !freshIssue ||
+      ["done", "cancelled"].includes(freshIssue.status) ||
+      (!["todo", "in_progress", "blocked"].includes(freshIssue.status) &&
+        freshIssue.status !== input.issue.status)
+    ) {
+      return null;
+    }
+
     const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
     const recoveryAction = await ensureSourceScopedStrandedRecoveryAction({
       issue: input.issue,
@@ -3247,10 +3269,25 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       });
     }
     const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
+    // Simmer local patch (SIM-3773): keep the assignee. Recovery ownership lives on the
+    // recovery action (its owner is woken to intervene); the source issue parks in place
+    // so a dead adapter can never route another agent's work across agents (SIM-3769:
+    // a Cody money-path ticket was rerouted to and executed by the org root).
+    // Narrow exception (re-site for the upstream failure-cause router): execution-review
+    // participant recovery may stamp the ACTIVE review participant — the agent whose run
+    // stranded and who already holds the ball per executionState (returnAssignee keeps
+    // the hand-back) — but only when the resolved owner IS that participant; a manager-
+    // ladder fallback still parks in place.
+    const stampReviewParticipant =
+      input.previousStatus === "in_review" &&
+      Boolean(input.recoveryOwnerAgentId) &&
+      recoveryAction.ownerAgentId === input.recoveryOwnerAgentId;
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",
       blockedByIssueIds: blockerIds,
-      assigneeAgentId: recoveryAction.ownerAgentId ?? input.issue.assigneeAgentId,
+      ...(stampReviewParticipant && recoveryAction.ownerAgentId
+        ? { assigneeAgentId: recoveryAction.ownerAgentId }
+        : {}),
     });
     if (!updated) return null;
     if (isProviderQuotaWait) return updated;
@@ -3370,29 +3407,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       recoveryCause,
     });
 
-    if (recoveryAction.ownerAgentId && recoveryAction.ownerAgentId === input.issue.assigneeAgentId) {
-      const [currentIssue] = await db
-        .select({
-          status: issues.status,
-          assigneeAgentId: issues.assigneeAgentId,
-        })
-        .from(issues)
-        .where(eq(issues.id, input.issue.id))
-        .limit(1);
-      if (
-        currentIssue &&
-        (currentIssue.status !== "blocked" ||
-          currentIssue.assigneeAgentId !== recoveryAction.ownerAgentId)
-      ) {
-        const reblocked = await issuesSvc.update(input.issue.id, {
-          status: "blocked",
-          blockedByIssueIds: blockerIds,
-          assigneeAgentId: recoveryAction.ownerAgentId,
-        });
-        if (reblocked) return reblocked;
-      }
-    }
-
+    // Simmer local patch (SIM-3773): no post-wake re-stamp. The daemon must never fight
+    // a concurrent writer (it repeatedly re-stamped assignee/status over manual CTO
+    // overrides during the SIM-3769 incident). If the issue is genuinely still stranded,
+    // the next reconcile sweep parks it again; convergence moves to the next tick
+    // instead of in-line.
     return updated;
   }
 
