@@ -6317,7 +6317,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     if (issue.status === "done" || issue.status === "cancelled") {
-      if (!resumeIntent && !wakeCommentId) {
+      // Corrective handoff wakes always carry resumeIntent: true, but they must
+      // still be cancelled when the issue is already terminal — there is nothing
+      // left to hand off. Without this guard the wakes start a run on a done
+      // issue, the run posts "no further action needed", and the cycle repeats
+      // for every queued corrective wake (SIM-4536).
+      const isHandoffWakeOnTerminalIssue = wakeReason === FINISH_SUCCESSFUL_RUN_HANDOFF_REASON;
+      if (isHandoffWakeOnTerminalIssue || (!resumeIntent && !wakeCommentId)) {
         return {
           stale: true,
           errorCode: "issue_terminal_status",
