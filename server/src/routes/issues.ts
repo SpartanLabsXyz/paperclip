@@ -1985,9 +1985,42 @@ export function issueRoutes(
     res.json(result);
   });
 
+// SIM-4676: every param this route actually reads. Anything outside this set
+// is silently dropped by Express, so a caller that misspells a filter gets a
+// 200 and an UNFILTERED list — a wrong world-model, not a failed call.
+// Real incident: an agent asked for its own work with assignedAgentId
+// (correct: assigneeAgentId), received all 59 of the company's issues
+// instead of its 10, re-selected a ticket it had already finished, and
+// shipped a duplicate PR. Warn now; reject once the logs are quiet.
+const ISSUE_LIST_KNOWN_QUERY_PARAMS = new Set([
+  "assigneeAgentId", "assigneeUserId", "attention", "descendantOf",
+  "excludeRoutineExecutions", "executionWorkspaceId", "inboxArchivedByUserId",
+  "includeBlockedBy", "includeBlockedInboxAttention", "includePluginOperations",
+  "includeRoutineExecutions", "labelId", "limit", "offset", "originId",
+  "originKind", "originKindPrefix", "parentId", "participantAgentId",
+  "projectId", "q", "sortDir", "sortField", "status", "touchedByUserId",
+  "unreadForUserId", "workspaceId",
+]);
+
   router.get("/companies/:companyId/issues", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    // SIM-4676: surface unrecognised filters instead of silently ignoring them.
+    const unknownQueryParams = Object.keys(req.query).filter(
+      (k) => !ISSUE_LIST_KNOWN_QUERY_PARAMS.has(k),
+    );
+    if (unknownQueryParams.length > 0) {
+      logger.warn(
+        {
+          unknownQueryParams,
+          actorType: req.actor?.type,
+          actorAgentId: req.actor?.agentId,
+          routePath: "/companies/:companyId/issues",
+        },
+        `issue list: ignoring unrecognised query param(s): ${unknownQueryParams.join(", ")} — the response is NOT filtered by them`,
+      );
+    }
+
     const assigneeUserFilterRaw = req.query.assigneeUserId as string | undefined;
     const touchedByUserFilterRaw = req.query.touchedByUserId as string | undefined;
     const inboxArchivedByUserFilterRaw = req.query.inboxArchivedByUserId as string | undefined;
