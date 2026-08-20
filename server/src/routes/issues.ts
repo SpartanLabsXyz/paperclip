@@ -2019,6 +2019,23 @@ const ISSUE_LIST_KNOWN_QUERY_PARAMS = new Set([
         },
         `issue list: ignoring unrecognised query param(s): ${unknownQueryParams.join(", ")} — the response is NOT filtered by them`,
       );
+      // Reject for AGENTS only. An agent asking a filtered question and being
+      // handed the whole company's work acts on it — that is how one run
+      // re-selected a ticket it had already finished and shipped a duplicate
+      // PR. Failing loudly is the only thing that makes it self-correct; it
+      // cannot read this warning.
+      //
+      // Board and unauthenticated callers keep warn-and-proceed. The web
+      // client authenticates as "board", and its full param set is not
+      // enumerated here — rejecting it could break the issue list for humans
+      // to fix a bug that only bites agents.
+      if (req.actor?.type === "agent") {
+        res.status(400).json({
+          error: `Unrecognised query param(s): ${unknownQueryParams.join(", ")}. They were IGNORED, so this response would not have been filtered by them. Did you mean assigneeAgentId?`,
+          unknownQueryParams,
+        });
+        return;
+      }
     }
 
     const assigneeUserFilterRaw = req.query.assigneeUserId as string | undefined;
