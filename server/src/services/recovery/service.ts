@@ -60,6 +60,11 @@ import {
   withRecoveryModelProfileHint,
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
+import {
+  buildWakeStormEscalationComment,
+  readWakeStormBreakerConfig,
+  shouldTripWakeStormBreaker,
+} from "./wakeup-storm-breaker.js";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
@@ -534,6 +539,26 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return { consecutive, latestFinishedAt };
   }
 
+  // Simmer local patch (SIM-2814): count system-recovery runs for an issue in
+  // a trailing window. Only runs whose context snapshot carries a retryReason
+  // are counted — those are exclusively automation-recovery wakes (stranded
+  // reconciler + transient-failure retry cascade), so genuine agent work and
+  // human-triggered wakes can never trip the breaker.
+  async function countRecentRecoveryRunsForIssue(issueId: string, windowMinutes: number) {
+    const cutoff = new Date(Date.now() - windowMinutes * 60_000);
+    const rows = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          gte(heartbeatRuns.createdAt, cutoff),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          sql`${heartbeatRuns.contextSnapshot} ->> 'retryReason' is not null`,
+        ),
+      );
+    return rows[0]?.count ?? 0;
+  }
+
   async function hasActiveExecutionPath(companyId: string, issueId: string) {
     const [run, deferredWake] = await Promise.all([
       db
@@ -587,7 +612,49 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     retryReason: "assignment_recovery" | "issue_continuation_needed";
     source: string;
     retryOfRunId?: string | null;
+    // Simmer local patch (SIM-2814): when the caller has the issue row +
+    // latest run in scope, the wake-storm breaker can escalate instead of
+    // silently skipping. Both reconciler call sites pass these.
+    stormBreakerIssue?: typeof issues.$inferSelect;
+    stormBreakerLatestRun?: LatestIssueRun;
   }) {
+    // Simmer local patch (SIM-2814): frequency breaker independent of the
+    // liveness judge's content classification. See wakeup-storm-breaker.ts.
+    const stormConfig = readWakeStormBreakerConfig();
+    const recentRecoveryRunCount = await countRecentRecoveryRunsForIssue(
+      input.issueId,
+      stormConfig.windowMinutes,
+    );
+    if (shouldTripWakeStormBreaker({ recentRecoveryRunCount, config: stormConfig })) {
+      logger.warn(
+        {
+          issueId: input.issueId,
+          agentId: input.agentId,
+          recentRecoveryRunCount,
+          windowMinutes: stormConfig.windowMinutes,
+          maxRecoveryRuns: stormConfig.maxRecoveryRuns,
+          source: input.source,
+        },
+        "wakeup-storm breaker tripped; refusing recovery enqueue (SIM-2814)",
+      );
+      const issue = input.stormBreakerIssue;
+      if (
+        issue &&
+        (issue.status === "todo" || issue.status === "in_progress")
+      ) {
+        await escalateStrandedAssignedIssue({
+          issue,
+          previousStatus: issue.status,
+          latestRun: input.stormBreakerLatestRun ?? null,
+          comment: buildWakeStormEscalationComment({ recentRecoveryRunCount, config: stormConfig }),
+        }).catch((err) => {
+          logger.error({ err, issueId: input.issueId }, "wake-storm escalation failed (SIM-2814)");
+          return null;
+        });
+      }
+      return null;
+    }
+
     const queued = await deps.enqueueWakeup(input.agentId, {
       source: "automation",
       triggerDetail: "system",
@@ -2287,6 +2354,20 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       });
     }
 
+    // Simmer local patch (SIM-3773): park-in-place recovery.
+    // Re-read the issue first: the sweep/heartbeat read can be stale, and a manual
+    // board/CTO PATCH (status reset, review move, cancel) must win over automatic
+    // escalation. Never escalate over a terminal or manually-moved issue (SIM-3769:
+    // recovery re-stamped a manual todo reset and later fired on a cancelled issue).
+    const [freshIssue] = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, input.issue.id))
+      .limit(1);
+    if (!freshIssue || !["todo", "in_progress", "blocked"].includes(freshIssue.status)) {
+      return null;
+    }
+
     const recoveryCause = input.recoveryCause ?? "stranded_assigned_issue";
     const recoveryAction = await ensureSourceScopedStrandedRecoveryAction({
       issue: input.issue,
@@ -2296,10 +2377,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
     });
     const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
+    // Simmer local patch (SIM-3773): keep the assignee. Recovery ownership lives on the
+    // recovery action (its owner is woken to intervene); the source issue parks in place
+    // so a dead adapter can never route another agent's work across agents (SIM-3769:
+    // a Cody money-path ticket was rerouted to and executed by the org root).
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",
       blockedByIssueIds: blockerIds,
-      assigneeAgentId: recoveryAction.ownerAgentId ?? input.issue.assigneeAgentId,
     });
     if (!updated) return null;
 
@@ -2408,29 +2492,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       recoveryCause,
     });
 
-    if (recoveryAction.ownerAgentId && recoveryAction.ownerAgentId === input.issue.assigneeAgentId) {
-      const [currentIssue] = await db
-        .select({
-          status: issues.status,
-          assigneeAgentId: issues.assigneeAgentId,
-        })
-        .from(issues)
-        .where(eq(issues.id, input.issue.id))
-        .limit(1);
-      if (
-        currentIssue &&
-        (currentIssue.status !== "blocked" ||
-          currentIssue.assigneeAgentId !== recoveryAction.ownerAgentId)
-      ) {
-        const reblocked = await issuesSvc.update(input.issue.id, {
-          status: "blocked",
-          blockedByIssueIds: blockerIds,
-          assigneeAgentId: recoveryAction.ownerAgentId,
-        });
-        if (reblocked) return reblocked;
-      }
-    }
-
+    // Simmer local patch (SIM-3773): no post-wake re-stamp. The daemon must never fight
+    // a concurrent writer (it repeatedly re-stamped assignee/status over manual CTO
+    // overrides during the SIM-3769 incident). If the issue is genuinely still stranded,
+    // the next reconcile sweep parks it again; convergence moves to the next tick
+    // instead of in-line.
     return updated;
   }
 
@@ -2557,6 +2623,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           retryReason: "assignment_recovery",
           source: "issue.assignment_recovery",
           retryOfRunId: latestRun.id,
+          stormBreakerIssue: issue,
+          stormBreakerLatestRun: latestRun,
         });
         if (queued) {
           result.dispatchRequeued += 1;
@@ -2632,6 +2700,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           retryReason: "issue_continuation_needed",
           source: "issue.productive_terminal_continuation_recovery",
           retryOfRunId: successfulRun.id,
+          stormBreakerIssue: issue,
+          stormBreakerLatestRun: successfulRun,
         });
         if (queued) {
           result.continuationRequeued += 1;

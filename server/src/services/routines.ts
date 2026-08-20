@@ -57,6 +57,7 @@ import { getSecretProvider } from "../secrets/provider-registry.js";
 import { parseCron, validateCron } from "./cron.js";
 import { heartbeatService } from "./heartbeat.js";
 import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
+import { resolveRoutineAssigneeAdapterOverrides } from "./routine-model-profiles.js";
 import { logActivity } from "./activity-log.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 
@@ -1246,6 +1247,10 @@ export function routineService(
             status: "todo",
             priority: input.routine.priority,
             assigneeAgentId,
+            // Simmer local patch (SIM-2814/SIM-2496): per-routine model
+            // profile via PAPERCLIP_ROUTINE_MODEL_PROFILES env map. Dispatch
+            // honors issues.assigneeAdapterOverrides.modelProfile.
+            assigneeAdapterOverrides: resolveRoutineAssigneeAdapterOverrides(input.routine.id),
             createdByAgentId: input.source === "manual" ? input.actor?.agentId ?? null : null,
             createdByUserId: manualRunnerUserId,
             originKind: issueOriginKind,

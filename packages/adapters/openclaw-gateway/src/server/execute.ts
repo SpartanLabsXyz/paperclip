@@ -86,7 +86,13 @@ type GatewayClientRequestOptions = {
   expectFinal?: boolean;
 };
 
-const PROTOCOL_VERSION = 3;
+// ===== SIMMER LOCAL PATCH #2 — DO NOT REMOVE WHEN PULLING UPSTREAM =====
+// OpenClaw >= 2026.5.16 raised the gateway WS minimum protocol from 3 to 4
+// (observed: 2026.5.20 rejects v3 handshakes with code 1002 "protocol mismatch").
+// Upstream fix PR #7283 (also #6138/#6188/#6785) — all unmerged as of 2026-06-10.
+// If upstream merges a protocol bump, delete this block and keep their constant.
+const PROTOCOL_VERSION = 4; // upstream value: 3
+// ===== END SIMMER LOCAL PATCH #2 =====
 const DEFAULT_SCOPES = ["operator.admin"];
 const DEFAULT_CLIENT_ID = "gateway-client";
 const DEFAULT_CLIENT_MODE = "backend";
@@ -1139,7 +1145,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     idempotencyKey: ctx.runId,
   };
   delete agentParams.text;
-  agentParams.paperclip = paperclipPayload;
+  // ===== SIMMER LOCAL PATCH — DO NOT REMOVE WHEN PULLING UPSTREAM =====
+  // OpenClaw rejects unknown root field paperclip (additionalProperties: false).
+  // PR #626 (6c9e639a, Mar 12 2026) fixed this; commit 91e040a6 (Mar 28) reintroduced it.
+  // 9+ open upstream PRs propose the same fix — none merged. Maintainer stance
+  // appears to be "paperclip envelope is intentional; OpenClaw should widen schema."
+  // See ~/.claude/projects/.../memory/reference_paperclip_openclaw_gateway_bug.md for full audit.
+  // If upstream finally merges, you can delete this entire block. Until then,
+  // keep the line below commented and re-apply on every git pull.
+  // agentParams.paperclip = paperclipPayload;
+  // ===== END SIMMER LOCAL PATCH =====
 
   const configuredAgentId = nonEmpty(ctx.config.agentId);
   if (configuredAgentId && !nonEmpty(agentParams.agentId)) {
